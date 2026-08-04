@@ -1,0 +1,21 @@
+# virtualenv — recreate with `uv venv && uv pip install -e .`
+.venv/
+venv/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+
+# generated media — outputs live in ComfyUI's output/ dir, not here
+*.mp4
+*.webm
+*.mp3
+*.wav
