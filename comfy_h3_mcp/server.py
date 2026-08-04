@@ -1,12 +1,15 @@
 """MCP server exposing MiniMax-H3 video+audio generation on a local ComfyUI.
 
-Six tools, not a general ComfyUI control plane. Generation is slow, so the
+Seven tools, not a general ComfyUI control plane. Generation is slow, so the
 generate tools submit and return a prompt_id immediately; poll with job_status.
 """
 
 from __future__ import annotations
 
 import random
+import re
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -38,9 +41,12 @@ mcp = MCPServer(
         "For anything with cuts, call the tool once PER SHOT, each with a single "
         "camera setup, then edit the clips together. For character or location "
         "consistency across shots, take a good frame from the first clip and "
-        "pass it to h3_reference_to_video as a reference image, addressed in "
-        "the prompt as <Picture 1>. Keep each shot to its own beat; 124 frames "
-        "(~5s) is plenty for one setup.\n\n"
+        "save it with grab_reference and pass it to h3_reference_to_video "
+        "in ref_images, addressed in the prompt as <Picture 1> with an explicit "
+        "job (\"the man in <Picture 1>, same coat, now from a low angle\"). "
+        "Use STILLS, not ref_videos: reference videos perform poorly and drag "
+        "their own soundtrack into the output. Keep each shot to its own beat; "
+        "124 frames (~5s) is plenty for one setup.\n\n"
         "SAGE ATTENTION: call list_assets FIRST to check sage_attention.global. "
         "If ComfyUI was launched with --use-sage-attention, sage is already "
         "active everywhere and the per-call sage_attention parameter is "
@@ -131,9 +137,9 @@ async def h3_image_to_video(
     path (uploaded automatically) or a name already in ComfyUI's input folder.
     length is a frame count at 24 fps and snaps up to the model's 17k+5 grid;
     124 frames is about 5 seconds, and the trained range is roughly 124-362.
-    Leave width/height unset: they default to 864x480, which is both faster
-    and closer to the prompt than larger canvases. Only raise it if the user
-    asks. This produces ONE continuous shot - it cannot contain cuts, so for a
+    Leave width/height unset: they default to 864x480, the template's draft
+    setting (~3-4 min). Full quality 16:9 is 1344x768 at ~2.5x the cost - draft
+    first, then re-run keepers at that size. This produces ONE continuous shot - it cannot contain cuts, so for a
     multi-shot sequence call this once per shot and edit the clips together
     rather than describing several shots in one prompt.
     Takes MINUTES: ~3-4 min at the defaults on an RTX 4090, longer at higher
@@ -202,9 +208,14 @@ async def h3_reference_to_video(
     automatically. ref_image_size "match" scales references to the output's
     pixel area; "max" uses a 2048px short edge for better identity fidelity but
     is several times slower, since reference tokens ride through every step.
-    This is the tool for CONSISTENCY ACROSS SHOTS: generate shot 1, pull a
-    frame of the character or location from it, and pass it here as a reference
-    for shots 2..n so they match. Leave width/height unset (864x480 default).
+    This is the tool for CONSISTENCY ACROSS SHOTS: generate shot 1, call
+    grab_reference to save a frame of the character or location, then pass that
+    filename in ref_images for shots 2..n so they match.
+    STRONGLY PREFER ref_images OVER ref_videos. Still references carry identity
+    reliably; reference videos work poorly and also drag their own soundtrack
+    into the result, which fights the audio you asked for in the prompt. Only
+    use ref_videos when the user explicitly wants motion transferred, and expect
+    to fix the audio afterwards. Leave width/height unset (864x480 default).
     Takes MINUTES; see estimated_seconds in the response and poll at that
     cadence. Check list_assets before setting sage_attention - it is redundant
     when ComfyUI already runs with --use-sage-attention.
@@ -368,20 +379,7 @@ async def job_preview(
     if not preview.ffmpeg_available():
         raise RuntimeError("ffmpeg is not on PATH; job_preview needs it.")
 
-    status = await job_status(prompt_id)
-    if status["status"] != "completed":
-        raise RuntimeError(
-            f"Job is {status['status']}, not completed. "
-            f"{status.get('detail') or status.get('errors') or ''}".strip()
-        )
-    if not status["outputs"]:
-        raise RuntimeError("Job completed but produced no output files.")
-
-    out = status["outputs"][0]
-    video = await preview.fetch_output(
-        out["filename"], out.get("subfolder", ""), out.get("type", "output")
-    )
-
+    out, video = await _completed_video(prompt_id)
     sheet = await preview.contact_sheet(video, columns, rows, tile_width)
     info = await preview.probe(video)
 
@@ -389,7 +387,9 @@ async def job_preview(
         f"{out['filename']} - {info.get('width')}x{info.get('height')}, "
         f"{info.get('frames', '?')} frames @ {info.get('fps', '?')} fps "
         f"({info.get('duration_seconds', '?')}s). Contact sheet is "
-        f"{columns}x{rows} frames sampled evenly across the clip, in reading order.\n"
+        f"{columns}x{rows} frames sampled evenly across the clip, numbered "
+        f"1..{columns * rows} in reading order. To reuse one as a reference "
+        f"image for a later shot, call grab_reference(prompt_id, tile=N).\n"
         f"File: {out['url']}",
         Image(data=sheet, format="jpeg"),
     ]
@@ -402,6 +402,91 @@ async def job_preview(
             blocks.append("No audio stream found in the output.")
 
     return blocks
+
+
+async def _completed_video(prompt_id: str) -> tuple[dict, bytes]:
+    """Fetch the rendered clip for a finished job, or explain why we can't."""
+    status = await job_status(prompt_id)
+    if status["status"] != "completed":
+        raise RuntimeError(
+            f"Job is {status['status']}, not completed. "
+            f"{status.get('detail') or status.get('errors') or ''}".strip()
+        )
+    if not status["outputs"]:
+        raise RuntimeError("Job completed but produced no output files.")
+    out = status["outputs"][0]
+    video = await preview.fetch_output(
+        out["filename"], out.get("subfolder", ""), out.get("type", "output")
+    )
+    return out, video
+
+
+@mcp.tool()
+async def grab_reference(
+    prompt_id: str,
+    tile: int | None = None,
+    frame: int | None = None,
+    time_seconds: float | None = None,
+    name: str | None = None,
+    columns: int = 4,
+    rows: int = 3,
+) -> list:
+    """Save one frame of a finished clip as a reusable reference image.
+
+    This is how you carry a character, costume or location across shots. Run
+    job_preview to see the contact sheet, pick the tile that best shows the
+    subject, then call this with that tile number - tiles are numbered 1..N in
+    reading order (left to right, top to bottom) and map back to the exact
+    source frame. Alternatively give an explicit frame index or time_seconds.
+
+    The frame is written into ComfyUI's input folder and the returned filename
+    can be passed straight to h3_reference_to_video's ref_images, or to
+    h3_image_to_video's first_frame/last_frame.
+
+    PREFER THIS OVER REFERENCE VIDEOS. A still carries identity far more
+    reliably than ref_videos, which also drag their soundtrack into the result.
+    Returns the saved filename plus the extracted image so you can confirm it.
+    """
+    if sum(x is not None for x in (tile, frame, time_seconds)) != 1:
+        raise ValueError("Give exactly one of: tile, frame, time_seconds.")
+    if not preview.ffmpeg_available():
+        raise RuntimeError("ffmpeg is not on PATH; grab_reference needs it.")
+
+    out, video = await _completed_video(prompt_id)
+    total = await preview.frame_count(video)
+
+    if tile is not None:
+        indices = preview.sheet_frame_indices(total, columns, rows)
+        if not 1 <= tile <= len(indices):
+            raise ValueError(f"tile must be 1..{len(indices)} for a {columns}x{rows} sheet.")
+        target = indices[tile - 1]
+        chosen = f"tile {tile} of {columns}x{rows}"
+    elif frame is not None:
+        target = frame
+        chosen = f"frame {frame}"
+    else:
+        target = int(round(time_seconds * graphs.FPS))
+        chosen = f"t={time_seconds}s"
+
+    if not 0 <= target < max(1, total):
+        raise ValueError(f"Resolved to frame {target}, outside 0..{total - 1}.")
+
+    stem = name or f"{Path(out['filename']).stem}_f{target:04d}"
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "_", stem)
+
+    with tempfile.TemporaryDirectory() as td:
+        png = Path(td) / f"{stem}.png"
+        data = await preview.extract_frame(video, target, png)
+        saved = await comfy.upload_asset(str(png))
+
+    return [
+        f"Saved '{saved}' to ComfyUI's input folder ({chosen} -> source frame "
+        f"{target} of {total}).\n"
+        f"Use it as ref_images=['{saved}'] with h3_reference_to_video and refer "
+        f"to it in the prompt as <Picture 1>, giving it an explicit job - e.g. "
+        f"\"the man in <Picture 1>, same coat and build, now from a low angle\".",
+        Image(data=data, format="png"),
+    ]
 
 
 @mcp.tool()

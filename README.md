@@ -1,7 +1,7 @@
 # comfy-h3-mcp
 
 A small MCP server for driving **MiniMax-H3** video+audio generation on a local
-ComfyUI. Five tools, not a general ComfyUI control plane — the point is to keep
+ComfyUI. Seven tools, not a general ComfyUI control plane — the point is to keep
 the agent's context cost near zero for the one thing this rig actually does.
 
 ## Tools
@@ -12,6 +12,7 @@ the agent's context cost near zero for the one thing this rig actually does.
 | `h3_reference_to_video` | Prompt + reference images / videos / audio (ref2va model) |
 | `job_status` | Poll a `prompt_id` → queued / running / completed / failed + output URLs |
 | `job_cancel` | Drop from queue if pending, interrupt if running |
+| `grab_reference` | Save a frame of a finished clip as a reusable reference still |
 | `list_assets` | H3 models present, and input files usable by name |
 
 Generation takes minutes, so the two generate tools **submit and return a
@@ -46,10 +47,11 @@ The estimator scales with pixels × steps × length and predicts all four within
 5.2%. Roughly 30 s of that is cold model load, which no setting reduces — the
 `nvfp4` text-encoder path is emulated on this hardware.
 
-**Higher resolution is not automatically better.** At 1344×768 the model drifted
-from the prompt (requested flying-car traffic barely appeared); at the template's
-864×480 it rendered clearly. 0.4 MP looks closer to H3's trained regime, so treat
-it as the working default and upscale in post if you need delivery resolution.
+**Draft small, finish large.** 864×480 is the template's draft setting; the
+model's documented full-quality 16:9 target is ~1.0 MP (1344×768). Iterate
+prompts at the default, then re-run keepers at 1344×768 with the same seed —
+noting that a seed does not guarantee an identical image across a resolution
+change, only a related composition.
 
 ## Sage attention
 
@@ -90,6 +92,12 @@ snapped them:
 - **References** are addressed positionally in the prompt as `<Picture i>`,
   `<Video k>`, `<Audio j>` — all **1-based per type**. Max 9 images, 3 videos,
   3 audio. A reference video's soundtrack is wired through automatically.
+- **Prefer stills to reference videos.** `ref_videos` carry identity poorly and
+  drag their own soundtrack into the output, fighting the audio the prompt asked
+  for. Use `grab_reference` to lift a frame from an earlier clip instead: run
+  `job_preview`, pick a tile off the contact sheet, and `grab_reference(
+  prompt_id, tile=N)` saves that exact source frame at full resolution into
+  ComfyUI's input folder, ready to pass as `ref_images`.
 - `ref_image_size="max"` uses a 2048 px short edge for better identity fidelity
   but is several times slower, because reference tokens ride through every
   sampling step.

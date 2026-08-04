@@ -43,23 +43,42 @@ async def fetch_output(filename: str, subfolder: str = "", type_: str = "output"
         return r.content
 
 
+async def frame_count(video: bytes) -> int:
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "in.mp4"
+        src.write_bytes(video)
+        code, out = await _run("ffprobe", "-v", "error", "-select_streams", "v:0",
+                               "-count_packets", "-show_entries",
+                               "stream=nb_read_packets", "-of", "csv=p=0", str(src))
+        try:
+            return int(out.decode().strip().splitlines()[0])
+        except (ValueError, IndexError):
+            return 0
+
+
+def sheet_frame_indices(total: int, columns: int, rows: int) -> list[int]:
+    """Which source frames land in each contact-sheet tile, in reading order.
+
+    Shared with contact_sheet() so a tile number the caller reads off the sheet
+    maps back to the exact frame - otherwise "use tile 7" grabs the wrong image.
+    """
+    want = columns * rows
+    if total < want:
+        return list(range(total))
+    step = max(1, total // want)
+    return [i * step for i in range(want)]
+
+
 async def contact_sheet(
     video: bytes, columns: int = 4, rows: int = 3, tile_width: int = 320
 ) -> bytes:
     """Sample columns*rows frames evenly across the clip into one JPEG grid."""
     want = columns * rows
+    total = await frame_count(video)
     with tempfile.TemporaryDirectory() as td:
         src = Path(td) / "in.mp4"
         dst = Path(td) / "sheet.jpg"
         src.write_bytes(video)
-
-        code, out = await _run("ffprobe", "-v", "error", "-select_streams", "v:0",
-                               "-count_packets", "-show_entries",
-                               "stream=nb_read_packets", "-of", "csv=p=0", str(src))
-        try:
-            total = int(out.decode().strip().splitlines()[0])
-        except (ValueError, IndexError):
-            total = 0
 
         # Even sampling when we know the frame count; otherwise let ffmpeg take
         # the first `want` frames rather than failing outright.
@@ -70,11 +89,28 @@ async def contact_sheet(
             select = "select='1'"
 
         vf = f"{select},scale={tile_width}:-1,tile={columns}x{rows}"
-        code, out = await _run("ffmpeg", "-y", "-i", str(src), "-vf", vf,
+        code, out = await _run("ffmpeg", "-nostdin", "-y", "-i", str(src), "-vf", vf,
                                "-frames:v", "1", "-q:v", "3", str(dst))
         if code != 0 or not dst.exists():
             raise ComfyError(f"ffmpeg contact sheet failed:\n{out.decode()[-1500:]}")
         return dst.read_bytes()
+
+
+async def extract_frame(video: bytes, frame: int, out_path: Path) -> bytes:
+    """Pull one exact frame out as PNG. Lossless, so it survives re-encoding."""
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "in.mp4"
+        src.write_bytes(video)
+        code, out = await _run(
+            "ffmpeg", "-nostdin", "-y", "-i", str(src),
+            "-vf", f"select='eq(n\\,{frame})'", "-frames:v", "1",
+            "-fps_mode", "passthrough", str(out_path),
+        )
+        if code != 0 or not out_path.exists():
+            raise ComfyError(
+                f"ffmpeg frame extraction failed:\n{out.decode()[-1500:]}"
+            )
+        return out_path.read_bytes()
 
 
 async def extract_audio(video: bytes) -> bytes | None:

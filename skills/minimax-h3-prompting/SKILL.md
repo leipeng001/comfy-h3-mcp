@@ -105,10 +105,31 @@ MiniMax's own demo prompt:
 > "Reference the Hitchcock camera movement from `<Video 1>`, have the character
 > in `<Picture 2>` sing, with the vocals matching `<Audio 3>`."
 
-**This is how you get consistency across shots.** Generate shot 1, pull a clean
-frame of the character or location, and pass it as `<Picture 1>` to every
-subsequent shot with an explicit job: *"the man in `<Picture 1>`, same coat and
-build, now seen from a low angle."*
+### Use stills. Avoid reference videos.
+
+**[Measured]** `ref_videos` underperform badly, and they drag their own
+soundtrack into the result — which fights whatever audio the prompt asked for.
+A **still image carries identity far more reliably**. Reach for `ref_videos`
+only when motion transfer is the explicit goal, and expect to repair the audio.
+
+### The consistency loop
+
+This is the workflow that actually holds a character across shots:
+
+1. Generate shot 1.
+2. `job_preview` → contact sheet, tiles numbered **1..N in reading order**.
+3. Pick the tile that best shows the subject — clean pose, face or silhouette
+   readable, not motion-blurred.
+4. `grab_reference(prompt_id, tile=N)` → extracts that exact source frame at
+   full resolution and saves it into ComfyUI's input folder.
+5. Pass the returned filename in `ref_images` for every later shot, and give it
+   a job in the prompt: *"the man in `<Picture 1>`, same coat and build, now
+   seen from a low angle."*
+
+`grab_reference` also takes `frame=` or `time_seconds=` when a specific moment
+matters more than a sheet tile. The same still works as `first_frame` /
+`last_frame` on `h3_image_to_video` if you want shot 2 to start exactly where
+shot 1 ended.
 
 `ref_image_size`: `match` is fast; `max` uses a 2048-px short edge for better
 identity fidelity but is **several times slower**, since reference tokens ride
@@ -180,6 +201,7 @@ A working reference implementation is in this repo at `scripts/assemble.sh`.
 - [ ] Technical camera/lens vocabulary, not adjectives
 - [ ] Audio described as its own clause
 - [ ] References tagged `<Picture 1>` etc., each with a stated job
+- [ ] Stills via `grab_reference`, not `ref_videos`
 - [ ] No on-screen text expected to be legible
 - [ ] Drafting at 864×480; finals at 1344×768
 - [ ] Length on the 17k+5 grid (124, 141, 158, …)
