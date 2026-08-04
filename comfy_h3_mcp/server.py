@@ -479,6 +479,17 @@ async def grab_reference(
         data = await preview.extract_frame(video, target, png)
         saved = await comfy.upload_asset(str(png))
 
+    # Confirm the loaders can actually see it before handing the name back.
+    # ComfyUI rescans its input dir per /object_info request today, so this
+    # passes immediately - but a filename that silently is not loadable would be
+    # a miserable failure to debug from the far side of a tool call.
+    visible = await comfy.input_image_visible(saved)
+    if not visible:
+        raise RuntimeError(
+            f"Uploaded '{saved}' but ComfyUI's LoadImage does not list it. "
+            f"Check the input folder and its permissions."
+        )
+
     return [
         f"Saved '{saved}' to ComfyUI's input folder ({chosen} -> source frame "
         f"{target} of {total}).\n"

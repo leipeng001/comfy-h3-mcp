@@ -131,6 +131,23 @@ async def upload_asset(path: str, subfolder: str = "") -> str:
     return f"{sub}/{name}" if sub else name
 
 
+async def input_image_visible(name: str) -> bool:
+    """Can LoadImage actually see this input file?
+
+    ComfyUI builds the LoadImage combo by scanning its input dir when
+    /object_info is requested, so a freshly uploaded file shows up right away.
+    Verifying it anyway turns a future caching change - or a permissions
+    problem - into a clear error instead of a mysterious workflow failure.
+    """
+    try:
+        info = await object_info("LoadImage")
+        options = info["LoadImage"]["input"]["required"]["image"][0]
+        return isinstance(options, list) and name in options
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
+        # Can't tell - don't block the caller on a check that itself failed.
+        return True
+
+
 def _is_local() -> bool:
     return any(h in COMFYUI_URL for h in ("127.0.0.1", "localhost", "::1"))
 
