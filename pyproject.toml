@@ -1,6 +1,6 @@
 [project]
 name = "comfy-h3-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Focused MCP server for MiniMax-H3 video+audio generation on a local ComfyUI"
 requires-python = ">=3.11"
 dependencies = [

@@ -1,25 +1,40 @@
 """MCP server exposing MiniMax-H3 video+audio generation on a local ComfyUI.
 
-Seven tools, not a general ComfyUI control plane. Generation is slow, so the
+Eight tools, not a general ComfyUI control plane. Generation is slow, so the
 generate tools submit and return a prompt_id immediately; poll with job_status.
 """
 
 from __future__ import annotations
 
+import base64
+import os
 import random
 import re
 import tempfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import httpx
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.types import Audio, Image
 
 from . import comfy, graphs, preview
 
+
+@asynccontextmanager
+async def _lifespan(_: MCPServer) -> AsyncIterator[None]:
+    try:
+        yield None
+    finally:
+        await comfy.close_client()
+
+
 mcp = MCPServer(
     "comfy-h3",
-    version="0.1.0",
+    version="0.2.0",
+    lifespan=_lifespan,
     instructions=(
         "MiniMax-H3 video+audio generation on a local ComfyUI.\n\n"
         "TIMING: generation takes MINUTES, not seconds. At the defaults "
@@ -52,7 +67,13 @@ mcp = MCPServer(
         "active everywhere and the per-call sage_attention parameter is "
         "redundant - do not set it, and do not tell the user to enable sage. "
         "Only pass sage_attention when global is false and the KJNodes pack is "
-        "available."
+        "available.\n\n"
+        "ACCELERATION: generation defaults to acceleration='balanced', which "
+        "combines Sol-Attn with conservative cross-step caching. Use 'quality' "
+        "for Sol-Attn without caching, 'fast' for drafts, or 'off' for the "
+        "native trajectory. All accelerated modes are inference-time "
+        "approximations and can change motion, fine detail, and audio. Re-run "
+        "important final shots with quality or off when fidelity matters."
     ),
 )
 
@@ -61,6 +82,7 @@ DEFAULT_STEPS = 20
 DEFAULT_SAMPLER = "res_multistep"
 DEFAULT_SCHEDULER = "simple"
 DEFAULT_MEGAPIXELS = 0.4
+GPT_IMAGE_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
 
 
 def _plan(width: int, height: int, megapixels: float, length: int) -> dict[str, Any]:
@@ -88,12 +110,12 @@ def _plan(width: int, height: int, megapixels: float, length: int) -> dict[str, 
 
 def _submitted(
     prompt_id: str, plan: dict[str, Any], seed: int, steps: int,
-    sage_attention: str, **extra: Any
+    sage_attention: str, acceleration: str, **extra: Any
 ) -> dict:
     sage_global = comfy.global_sage_attention()
     sage_on = bool(sage_global) or sage_attention != "disabled"
     est = graphs.estimate_runtime(
-        plan["width"], plan["height"], plan["length"], steps, sage_on
+        plan["width"], plan["height"], plan["length"], steps, sage_on, acceleration
     )
     poll = max(15, est["estimated_seconds"] // 8)
     return {
@@ -104,6 +126,7 @@ def _submitted(
         **plan,
         **est,
         "sage_active": sage_on,
+        "acceleration": acceleration,
         **extra,
         "next": (
             f"Poll job_status(prompt_id) about every {poll}s. This is expected "
@@ -129,6 +152,7 @@ async def h3_image_to_video(
     shift_audio: float | None = None,
     filename_prefix: str = "video/h3_i2v",
     sage_attention: str = "disabled",
+    acceleration: str = "balanced",
 ) -> dict:
     """Generate video with synchronized audio from a text prompt, optionally
     anchored by a first and/or last keyframe (MiniMax-H3 fl2va model).
@@ -147,10 +171,17 @@ async def h3_image_to_video(
     job_status at that cadence instead of assuming a long run has hung.
     Do NOT set sage_attention without first checking list_assets - if ComfyUI
     runs with --use-sage-attention, sage is already on and this is redundant.
+    acceleration defaults to "balanced" (Sol-Attn + conservative EasyCache).
+    Use "quality" for Sol-Attn without cache, "fast" for draft speed, or "off"
+    for the native trajectory. Accelerated modes can change the sample.
     Returns immediately with a prompt_id - poll job_status to get the output.
     """
     if sage_attention not in graphs.SAGE_MODES:
         raise ValueError(f"sage_attention must be one of {list(graphs.SAGE_MODES)}")
+    if acceleration not in graphs.ACCELERATION_PRESETS:
+        raise ValueError(
+            f"acceleration must be one of {list(graphs.ACCELERATION_PRESETS)}"
+        )
     seed = random.randint(0, 2**32 - 1) if seed is None else seed
     plan = _plan(width, height, megapixels, length)
 
@@ -172,10 +203,13 @@ async def h3_image_to_video(
         shift_audio=shift_audio,
         filename_prefix=filename_prefix,
         sage_attention=sage_attention,
+        acceleration=acceleration,
     )
     prompt_id = await comfy.submit(graph)
     mode = "text-to-video" if not (first or last) else "keyframe-guided"
-    return _submitted(prompt_id, plan, seed, steps, sage_attention, mode=mode)
+    return _submitted(
+        prompt_id, plan, seed, steps, sage_attention, acceleration, mode=mode
+    )
 
 
 @mcp.tool()
@@ -197,6 +231,7 @@ async def h3_reference_to_video(
     shift_audio: float | None = None,
     filename_prefix: str = "video/h3_ref2v",
     sage_attention: str = "disabled",
+    acceleration: str = "balanced",
 ) -> dict:
     """Generate video with synchronized audio from a prompt plus reference
     images, videos, and/or audio (MiniMax-H3 ref2va model).
@@ -219,6 +254,9 @@ async def h3_reference_to_video(
     Takes MINUTES; see estimated_seconds in the response and poll at that
     cadence. Check list_assets before setting sage_attention - it is redundant
     when ComfyUI already runs with --use-sage-attention.
+    acceleration defaults to "balanced" (Sol-Attn + conservative EasyCache).
+    Use "quality" for Sol-Attn without cache, "fast" for draft speed, or "off"
+    for the native trajectory. Accelerated modes can change the sample.
     Returns immediately with a prompt_id - poll job_status to get the output.
     """
     ref_images = ref_images or []
@@ -240,6 +278,10 @@ async def h3_reference_to_video(
 
     if sage_attention not in graphs.SAGE_MODES:
         raise ValueError(f"sage_attention must be one of {list(graphs.SAGE_MODES)}")
+    if acceleration not in graphs.ACCELERATION_PRESETS:
+        raise ValueError(
+            f"acceleration must be one of {list(graphs.ACCELERATION_PRESETS)}"
+        )
     seed = random.randint(0, 2**32 - 1) if seed is None else seed
     plan = _plan(width, height, megapixels, length)
 
@@ -264,6 +306,7 @@ async def h3_reference_to_video(
         shift_audio=shift_audio,
         filename_prefix=filename_prefix,
         sage_attention=sage_attention,
+        acceleration=acceleration,
     )
     prompt_id = await comfy.submit(graph)
     return _submitted(
@@ -272,6 +315,7 @@ async def h3_reference_to_video(
         seed,
         steps,
         sage_attention,
+        acceleration,
         references={
             "images": len(images),
             "videos": len(videos),
@@ -501,6 +545,77 @@ async def grab_reference(
 
 
 @mcp.tool()
+async def gpt_image_first_frame(
+    prompt: str,
+    size: str = "1536x1024",
+    quality: str = "medium",
+    name: str | None = None,
+) -> list:
+    """Generate a GPT Image still and make it immediately usable by ComfyUI.
+
+    Uses OpenAI's gpt-image-2 model, then uploads the returned PNG into
+    ComfyUI's input folder. The returned filename is ready to use as
+    h3_image_to_video(first_frame=...) or h3_reference_to_video(ref_images=...).
+    Requires OPENAI_API_KEY in this MCP server's environment. Generation incurs
+    OpenAI API usage. Use a clear visual prompt and a size matching the intended
+    H3 shot; 1536x1024 is a strong landscape default.
+    """
+    if size not in GPT_IMAGE_SIZES:
+        raise ValueError(f"size must be one of: {sorted(GPT_IMAGE_SIZES)}")
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set for the comfy-h3 MCP server. "
+            "Add it to the environment that launches Codex, then restart Codex."
+        )
+    if quality not in {"low", "medium", "high", "auto"}:
+        raise ValueError("quality must be one of: low, medium, high, auto.")
+
+    request = {
+        "model": "gpt-image-2",
+        "prompt": prompt,
+        "size": size,
+        "quality": quality,
+        "output_format": "png",
+    }
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0)) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/images/generations",
+            headers={"Authorization": f"Bearer {key}"},
+            json=request,
+        )
+    if response.is_error:
+        try:
+            detail = response.json().get("error", {}).get("message", response.text)
+        except ValueError:
+            detail = response.text
+        raise RuntimeError(f"GPT Image request failed ({response.status_code}): {detail}")
+
+    try:
+        image_data = base64.b64decode(response.json()["data"][0]["b64_json"])
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError("GPT Image returned no usable PNG data.") from exc
+
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "_", name or "gpt_image_first_frame")
+    with tempfile.TemporaryDirectory() as td:
+        png = Path(td) / f"{stem}.png"
+        png.write_bytes(image_data)
+        saved = await comfy.upload_asset(str(png))
+
+    if not await comfy.input_image_visible(saved):
+        raise RuntimeError(
+            f"Uploaded '{saved}' but ComfyUI's LoadImage does not list it. "
+            "Check the input folder and its permissions."
+        )
+    return [
+        f"Generated with gpt-image-2 and saved to ComfyUI input as '{saved}'.\n"
+        f"Pass first_frame='{saved}' to h3_image_to_video, or use it as "
+        f"ref_images=['{saved}'] with h3_reference_to_video.",
+        Image(data=image_data, format="png"),
+    ]
+
+
+@mcp.tool()
 async def list_assets() -> dict:
     """List what this ComfyUI can actually load: H3 models, and the images,
     videos and audio already sitting in the input folder (usable by name)."""
@@ -520,6 +635,8 @@ async def list_assets() -> dict:
 
     sage_global = comfy.global_sage_attention()
     sage_node = graphs.SAGE_NODE in info
+    sol_node = graphs.SOL_NODE in info
+    easycache_node = graphs.EASYCACHE_NODE in info
     if sage_global:
         sage_advice = (
             "Sage is ALREADY ACTIVE globally (--use-sage-attention). Do not pass "
@@ -545,6 +662,21 @@ async def list_assets() -> dict:
             "global": sage_global,
             "patch_node_available": sage_node,
             "advice": sage_advice,
+        },
+        "acceleration": {
+            "default": "balanced",
+            "presets": {
+                "off": "Native H3 trajectory (global Sage still applies).",
+                "quality": "Sol-Attn only; denser and no cross-step cache.",
+                "balanced": "Sol-Attn plus conservative cross-step cache.",
+                "fast": "More sparse Sol-Attn plus standard EasyCache threshold.",
+            },
+            "sol_attention_available": sol_node,
+            "easycache_available": easycache_node,
+            "warning": (
+                "Accelerated modes are approximate and can change motion, fine "
+                "detail, and audio. Use off for a native A/B reference."
+            ),
         },
         "timing_reference": {
             "864x480, 20 steps, sage": "~3m 43s",

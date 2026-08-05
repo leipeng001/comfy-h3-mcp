@@ -1,7 +1,7 @@
 # comfy-h3-mcp
 
 A small MCP server for driving **MiniMax-H3** video+audio generation on a local
-ComfyUI. Seven tools, not a general ComfyUI control plane — the point is to keep
+ComfyUI. Eight tools, not a general ComfyUI control plane — the point is to keep
 the agent's context cost near zero for the one thing this rig actually does.
 
 ## Tools
@@ -12,12 +12,55 @@ the agent's context cost near zero for the one thing this rig actually does.
 | `h3_reference_to_video` | Prompt + reference images / videos / audio (ref2va model) |
 | `job_status` | Poll a `prompt_id` → queued / running / completed / failed + output URLs |
 | `job_cancel` | Drop from queue if pending, interrupt if running |
+| `job_preview` | Return a contact sheet and soundtrack for a finished clip |
 | `grab_reference` | Save a frame of a finished clip as a reusable reference still |
+| `gpt_image_first_frame` | Generate and upload a GPT Image keyframe (metered API) |
 | `list_assets` | H3 models present, and input files usable by name |
 
 Generation takes minutes, so the two generate tools **submit and return a
 `prompt_id` immediately**. There is no session state — the `prompt_id` is the
 only handle, and ComfyUI already owns it.
+
+## Acceleration presets
+
+Both generation tools accept one `acceleration` value:
+
+| Preset | Stack | Use |
+|---|---|---|
+| `off` | Native H3 path (global Sage still applies) | Native-trajectory A/B reference |
+| `quality` | Sol-Attn, `tau=1.0`, edge blocks dense | Quality-sensitive accelerated renders |
+| `balanced` (default) | Sol-Attn, `tau=1.3` + EasyCache `0.10` | Normal local generation |
+| `fast` | Sol-Attn, `tau=1.5` + EasyCache `0.20` | Prompt and motion drafts |
+
+These are inference-time approximations. They do not retrain or modify the
+checkpoint, but they can change motion, fine detail, and audio for the same
+seed. Keep `off` available as the reference and re-run important shots with
+`quality` or `off` when fidelity matters.
+
+The Sol-Attn custom node must be installed in ComfyUI:
+
+```bash
+cd /path/to/ComfyUI/custom_nodes
+git clone https://github.com/kijai/ComfyUI-SolAttn_triton.git
+```
+
+`list_assets` reports whether both `SolAttnPatch` and native `EasyCache` are
+loaded. Sol-Attn's Triton kernels compile for each new tensor shape, so the
+first run at a resolution/duration can be slower than subsequent warm runs.
+
+## ComfyUI GUI workflow
+
+Load [`workflows/minimax_h3_sol_balanced.json`](workflows/minimax_h3_sol_balanced.json)
+from ComfyUI's **Workflows → Open** menu. It is derived from ComfyUI's official
+MiniMax-H3 text/image-to-video template and inserts the measured balanced path:
+
+```text
+UNETLoader → SolAttnPatch → EasyCache → scheduler + guider
+```
+
+The workflow opens at 0.4 MP, 5 seconds, and 20 RES multistep steps. Global
+SageAttention remains controlled by the ComfyUI launch flag. The note inside
+the workflow gives the `quality`, `balanced`, and `fast` settings.
 
 ## Setup
 
@@ -30,6 +73,10 @@ claude mcp add comfy-h3 -s user \
 
 `COMFYUI_URL` defaults to `http://127.0.0.1:8188`.
 
+The optional `gpt_image_first_frame` tool also needs `OPENAI_API_KEY` in the
+environment that launches the MCP server. It uses the metered GPT Image API;
+the local H3 generation tools do not require that key.
+
 ## Timing
 
 Generation takes **minutes**. Every submit returns `estimated_seconds` plus a
@@ -39,13 +86,17 @@ suggested poll interval, so a client knows the difference between "slow" and
 | Config | Time |
 |---|---|
 | 864×480, 20 steps, sage | 3m 43s |
+| 864×480, 20 steps, sage + `balanced` | **2m 33s** |
+| 864×480, 20 steps, sage + `fast` (warm) | **1m 52s** |
 | 864×480, 24 steps, sage | 4m 11s |
 | 1344×768, 30 steps, sage | 13m 13s |
 | 1344×768, 30 steps, no sage | 18m 02s |
 
-The estimator scales with pixels × steps × length and predicts all four within
-5.2%. Roughly 30 s of that is cold model load, which no setting reduces — the
-`nvfp4` text-encoder path is emulated on this hardware.
+The estimator scales with pixels × steps × length. Its accelerated factors are
+fitted to the two local measurements above. `balanced` skipped 5/20 denoiser
+evaluations; `fast` skipped 7/20. Roughly 30 s is fixed model load/decode work,
+which these DiT optimizations do not remove — the `nvfp4` text-encoder path is
+emulated on this hardware.
 
 **Draft small, finish large.** 864×480 is the template's draft setting; the
 model's documented full-quality 16:9 target is ~1.0 MP (1344×768). Iterate
@@ -127,7 +178,7 @@ entirely. Set either one to insert the node and override the model default.
 ## Graph shape
 
 ```
-UNETLoader ──────────────────────┐
+UNETLoader ─► Sol-Attn ─► EasyCache ─┐
 CLIPLoader(minimax) ─┐           ├─► BasicGuider ─┐
 VAELoader(video) ────┼─► MiniMaxH3{ImageToVideo,  │
 VAELoader(audio) ────┘      ReferenceToVideo}     │

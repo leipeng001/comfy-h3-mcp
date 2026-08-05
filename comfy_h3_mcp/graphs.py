@@ -62,17 +62,26 @@ ASPECT_16_9 = (16, 9)
 
 
 def estimate_runtime(
-    width: int, height: int, length: int, steps: int, sage: bool
+    width: int,
+    height: int,
+    length: int,
+    steps: int,
+    sage: bool,
+    acceleration: str = "off",
 ) -> dict[str, Any]:
     """Rough wall-clock estimate so callers know whether to expect 3 min or 20."""
     rate = SECS_PER_PIXEL_STEP_SAGE if sage else SECS_PER_PIXEL_STEP_PLAIN
     per_step = width * height * rate * (length / 124)
-    total = per_step * steps + MODEL_LOAD_COLD_SECS
+    speedup = ACCELERATION_ESTIMATED_SPEEDUP[acceleration]
+    total = per_step * steps / speedup + MODEL_LOAD_COLD_SECS
     return {
         "estimated_seconds": round(total),
         "estimated": f"~{int(total // 60)}m {int(total % 60):02d}s",
         "seconds_per_step": round(per_step, 1),
-        "basis": "RTX 4090 measurements; scales with pixels x steps x length",
+        "basis": (
+            "RTX 4090 measurements; scales with pixels x steps x length; "
+            f"{acceleration} acceleration estimate"
+        ),
     }
 
 
@@ -169,6 +178,68 @@ SAGE_MODES = (
     "sageattn3_per_block_mean",
 )
 
+SOL_NODE = "SolAttnPatch"
+EASYCACHE_NODE = "EasyCache"
+ACCELERATION_PRESETS: dict[str, dict[str, Any]] = {
+    "off": {},
+    # Sol-Attn only, with a denser threshold and sensitive edge blocks exact.
+    "quality": {
+        "sol_tau": 1.0,
+        "dense_blocks": "0,-1",
+    },
+    # Sol-Attn plus a low EasyCache threshold: useful default for local drafts.
+    "balanced": {
+        "sol_tau": 1.3,
+        "dense_blocks": "0,-1",
+        "cache_threshold": 0.10,
+    },
+    # More sparsity and ComfyUI's standard cache threshold. Approximate output.
+    "fast": {
+        "sol_tau": 1.5,
+        "dense_blocks": "0,-1",
+        "cache_threshold": 0.20,
+    },
+}
+ACCELERATION_ESTIMATED_SPEEDUP = {
+    "off": 1.0,
+    "quality": 1.18,
+    # Sampling-path factors fitted from the local 4090 measurements below;
+    # fixed model-load/decode time is added separately by estimate_runtime.
+    "balanced": 1.57,
+    "fast": 2.35,
+}
+
+
+def _apply_acceleration(g: GraphBuilder, model: str, preset: str) -> str:
+    """Patch the model with the selected inference-only acceleration stack."""
+    config = ACCELERATION_PRESETS[preset]
+    if "sol_tau" in config:
+        model = g.add(
+            SOL_NODE,
+            model=[model, 0],
+            tau=config["sol_tau"],
+            start_percent=0.20,
+            end_percent=0.90,
+            min_tokens=4096,
+            int8_qk=True,
+            sink_conditioning="exact_kv_and_rows",
+            morton=False,
+            morton_curve="2d_frame",
+            dense_blocks=config["dense_blocks"],
+            verbose=False,
+            use_tma=False,
+        )
+    if "cache_threshold" in config:
+        model = g.add(
+            EASYCACHE_NODE,
+            model=[model, 0],
+            reuse_threshold=config["cache_threshold"],
+            start_percent=0.15,
+            end_percent=0.90,
+            verbose=False,
+        )
+    return model
+
 
 def _common_loaders(
     g: GraphBuilder,
@@ -176,6 +247,7 @@ def _common_loaders(
     shift_video: float | None,
     shift_audio: float | None,
     sage_attention: str = "disabled",
+    acceleration: str = "balanced",
 ):
     model = g.add("UNETLoader", unet_name=unet, weight_dtype="default")
 
@@ -192,6 +264,8 @@ def _common_loaders(
             shift_video=12.0 if shift_video is None else shift_video,
             shift_audio=3.0 if shift_audio is None else shift_audio,
         )
+
+    model = _apply_acceleration(g, model, acceleration)
 
     clip = g.add("CLIPLoader", clip_name=TEXT_ENCODER, type=CLIP_TYPE, device="default")
     video_vae = g.add("VAELoader", vae_name=VAE_VIDEO)
@@ -215,10 +289,11 @@ def build_image_to_video(
     shift_audio: float | None,
     filename_prefix: str,
     sage_attention: str = "disabled",
+    acceleration: str = "balanced",
 ) -> dict[str, Any]:
     g = GraphBuilder()
     model, clip, video_vae, audio_vae = _common_loaders(
-        g, MODEL_FL2VA, shift_video, shift_audio, sage_attention
+        g, MODEL_FL2VA, shift_video, shift_audio, sage_attention, acceleration
     )
 
     cond_inputs: dict[str, Any] = {
@@ -269,10 +344,11 @@ def build_reference_to_video(
     shift_audio: float | None,
     filename_prefix: str,
     sage_attention: str = "disabled",
+    acceleration: str = "balanced",
 ) -> dict[str, Any]:
     g = GraphBuilder()
     model, clip, video_vae, audio_vae = _common_loaders(
-        g, MODEL_REF2VA, shift_video, shift_audio, sage_attention
+        g, MODEL_REF2VA, shift_video, shift_audio, sage_attention, acceleration
     )
 
     cond_inputs: dict[str, Any] = {
