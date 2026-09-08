@@ -3,11 +3,16 @@
 The frame-count and canvas math mirrors comfy_extras/nodes_minimax_h3.py so the
 caller sees the real duration/resolution up front instead of discovering that
 ComfyUI silently snapped them.
+
+Model weights (8G playbook): DmitryDB NVFP4 compact via local `*_nf4.safetensors`
+aliases. Requires Comfy ops.py all-NUL comfy_quant patch on 0.33.1.
 """
 
 from __future__ import annotations
 
 import math
+import os
+from pathlib import Path
 from typing import Any
 
 FPS = 24
@@ -15,12 +20,161 @@ CANVAS_MULTIPLE = 32
 BASE_SHORT_EDGE = 768
 MAX_PIXELS = 768 * 1344
 
-MODEL_FL2VA = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
-MODEL_REF2VA = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+# Preferred non-pruned names (first existing wins). Override with env.
+# DmitryDB NVFP4 compact (~10.86 GiB) is the 8G target; requires Comfy ops.py
+# all-NUL comfy_quant fix (local patch on 0.33.1). Official full INT8 abandoned.
+_REF2VA_CANDIDATES = (
+    "minimax_h3_ref2va_nf4.safetensors",
+    "minimax_h3_ref2va_nvfp4.safetensors",
+    "minimax_h3_ref2va_nvfp4_compact.safetensors",
+    "MiniMax-H3_Ref2VA-NVFP4.safetensors",
+    "minimax_h3_ref2va_nvfp4_full.safetensors",
+    "minimax_h3_ref2va_nvfp4_mixed.safetensors",
+    "minimax_h3_ref2va.safetensors",
+)
+_FL2VA_CANDIDATES = (
+    "minimax_h3_fl2va_nf4.safetensors",
+    "minimax_h3_fl2va_nvfp4.safetensors",
+    "minimax_h3_fl2va_nvfp4_compact.safetensors",
+    "MiniMax-H3_FL2VA-NVFP4.safetensors",
+    "minimax_h3_fl2va_nvfp4_full.safetensors",
+    "minimax_h3_fl2va_nvfp4_mixed.safetensors",
+    "minimax_h3_fl2va.safetensors",
+)
+_PRUNED_REF2VA = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+_PRUNED_FL2VA = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+# Skip partial HF downloads (official int8 is ~20–35 GiB; stubs are KB–GB mid-flight).
+_MIN_WEIGHT_BYTES = 8 * 1024 ** 3
+
 VAE_VIDEO = "minimax_h3_video_vae_fp16.safetensors"
 VAE_AUDIO = "minimax_h3_audio_vae_fp32.safetensors"
 TEXT_ENCODER = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 CLIP_TYPE = "minimax"
+
+
+def _video_vae_name() -> str:
+    return os.environ.get("H3_VIDEO_VAE", "").strip() or VAE_VIDEO
+
+
+def _audio_vae_name() -> str:
+    return os.environ.get("H3_AUDIO_VAE", "").strip() or VAE_AUDIO
+
+
+_REMOTE_REF2VA = "minimax_h3_ref2va_int8_convrot.safetensors"
+_REMOTE_FL2VA = "minimax_h3_fl2va_int8_convrot.safetensors"
+_REMOTE_TE = "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+
+
+def _text_encoder_name() -> str:
+    return os.environ.get("H3_TEXT_ENCODER", "").strip() or TEXT_ENCODER
+
+
+def _is_remote_stack() -> bool:
+    return os.environ.get("H3_REMOTE", "").strip().lower() in {"1", "true", "yes"}
+
+
+# Back-compat aliases — resolved at import / first use
+MODEL_FL2VA = _PRUNED_FL2VA
+MODEL_REF2VA = _PRUNED_REF2VA
+
+
+def _diffusion_models_dir() -> Path:
+    override = os.environ.get("H3_DIFFUSION_MODELS_DIR", "").strip()
+    if override:
+        return Path(override)
+    return Path(r"D:\aigc\ComfyUI\ComfyUI\models\diffusion_models")
+
+
+def _weight_ready(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size >= _MIN_WEIGHT_BYTES
+    except OSError:
+        return False
+
+
+def _pick_model(candidates: tuple[str, ...], *, pruned: str, kind: str) -> str:
+    env_key = "H3_REF2VA_MODEL" if kind == "ref2va" else "H3_FL2VA_MODEL"
+    env_name = os.environ.get(env_key, "").strip()
+    models_dir = _diffusion_models_dir()
+    if env_name:
+        # Remote Comfy: trust the filename without checking the local D: disk.
+        if _is_remote_stack() or not models_dir.is_dir():
+            return env_name
+        p = models_dir / env_name
+        if _weight_ready(p):
+            return env_name
+        raise FileNotFoundError(
+            f"{env_key}={env_name} missing or incomplete under {models_dir} "
+            f"(need >= {_MIN_WEIGHT_BYTES // 1024**3} GiB)"
+        )
+
+    if _is_remote_stack():
+        return _REMOTE_REF2VA if kind == "ref2va" else _REMOTE_FL2VA
+
+    for name in candidates:
+        if _weight_ready(models_dir / name):
+            return name
+
+    allow_pruned = os.environ.get("H3_ALLOW_PRUNED", "").strip() in {"1", "true", "yes"}
+    if allow_pruned and _weight_ready(models_dir / pruned):
+        print(
+            f"h3_model_warn using PRUNED {pruned} "
+            f"(set a non-pruned file or unset H3_ALLOW_PRUNED). "
+            f"Tried: {', '.join(candidates)}"
+        )
+        return pruned
+
+    tried = ", ".join(candidates)
+    raise FileNotFoundError(
+        f"No non-pruned MiniMax H3 {kind} weights under {models_dir}.\n"
+        f"Tried: {tried}\n"
+        f"Pruned fallback exists as {pruned} but is blocked "
+        f"(pruned drops logic/faces per 8G playbook).\n"
+        f"Download NF4 or v2 INT8 full weights, or set {env_key}=filename, "
+        f"or temporarily H3_ALLOW_PRUNED=1 for smoke tests only."
+    )
+
+
+def resolve_h3_models() -> tuple[str, str]:
+    """Return (ref2va_name, fl2va_name); updates module MODEL_* aliases."""
+    global MODEL_REF2VA, MODEL_FL2VA, TEXT_ENCODER
+    MODEL_REF2VA = _pick_model(_REF2VA_CANDIDATES, pruned=_PRUNED_REF2VA, kind="ref2va")
+    MODEL_FL2VA = _pick_model(_FL2VA_CANDIDATES, pruned=_PRUNED_FL2VA, kind="fl2va")
+    te = os.environ.get("H3_TEXT_ENCODER", "").strip()
+    if te:
+        TEXT_ENCODER = te
+    elif _is_remote_stack():
+        TEXT_ENCODER = _REMOTE_TE
+    return MODEL_REF2VA, MODEL_FL2VA
+
+
+def apply_model_stack_from_params(params: dict | None) -> None:
+    """Push shot_params model names into env for resolve_h3_models (remote INT8)."""
+    if not params:
+        return
+    if params.get("comfy_backend") == "remote" or params.get("h3_ref2va_model"):
+        os.environ["H3_REMOTE"] = "1"
+    else:
+        os.environ.pop("H3_REMOTE", None)
+        for k in ("H3_REF2VA_MODEL", "H3_FL2VA_MODEL", "H3_TEXT_ENCODER"):
+            # Only clear if we previously set remote names; leave user env alone
+            # when params carry no override.
+            pass
+    if params.get("h3_ref2va_model"):
+        os.environ["H3_REF2VA_MODEL"] = str(params["h3_ref2va_model"])
+    if params.get("h3_fl2va_model"):
+        os.environ["H3_FL2VA_MODEL"] = str(params["h3_fl2va_model"])
+    if params.get("h3_text_encoder"):
+        os.environ["H3_TEXT_ENCODER"] = str(params["h3_text_encoder"])
+
+
+# Resolve eagerly when diffusion dir exists; keep pruned names if resolve fails
+# so import still works for math helpers — build_* will re-resolve.
+try:
+    if _diffusion_models_dir().is_dir():
+        resolve_h3_models()
+except FileNotFoundError:
+    pass
 
 
 def align_frame_count(n: int) -> int:
@@ -112,6 +266,112 @@ class GraphBuilder:
         return nid
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _two_pass_enabled(*, profile: str | None = None) -> bool:
+    """REFINE_TWO_PASS only applies when profile is refine (never draft)."""
+    if not _env_flag("REFINE_TWO_PASS"):
+        return False
+    if profile is None:
+        profile = os.environ.get("H3_RESOURCE_PROFILE", "").strip().lower()
+    if profile and profile != "refine":
+        return False
+    # If profile unset but flag on, allow (API/MCP callers set profile via env).
+    return True
+
+
+def _split_sigma_start(steps: int) -> int:
+    """Pass1/pass2 cut for SplitSigmas.
+
+    Goldfish: BasicScheduler steps=12, SplitSigmas step=8 (pass1 ≈ 2/3).
+    Spatial ×1.5 needs pass1 far enough along — early cuts (e.g. 8/20) leave a
+    mid-noise latent that upscale destroys; ~≥50–60% of steps on pass1 works.
+
+    Explicit ``H3_SPLIT_SIGMA_START`` is honored as-is (no auto-nudge).
+    """
+    raw = os.environ.get("H3_SPLIT_SIGMA_START", "").strip()
+    if raw:
+        split = int(raw)
+        return max(1, min(steps - 1, split))
+    # Default: first ~60% on pass1 (goldfish 8/12).
+    return max(1, min(steps - 1, int(round(steps * 0.6))))
+
+
+def _pass2_manual_sigmas() -> str | None:
+    """Pass2 sigma schedule after spatial upscale.
+
+    Mid-SplitSigmas + ×1.5 still yields soft mush / no subject even when not
+    tan/grid. Official Upscaler example restarts pass2 at high sigma.
+    Default: that ManualSigmas list. Set ``H3_PASS2_MANUAL_SIGMAS=`` empty
+    string only when intentionally continuing SplitSigmas-low (identity upscale).
+    """
+    if "H3_PASS2_MANUAL_SIGMAS" in os.environ:
+        return os.environ["H3_PASS2_MANUAL_SIGMAS"].strip() or None
+    return "0.9035, 0.6316, 0.3158, 0.0000"
+
+
+def _spatial_upscale(mode: str) -> bool:
+    return (mode or "").strip().lower() not in {"none", "identity", "1.0", ""}
+
+
+def _latent_upscale_node(
+    g: GraphBuilder,
+    *,
+    latent: str,
+    mode: str,
+) -> str:
+    """Spatial upscale between passes. Separates AV nested latent like 金鱼图.
+
+    stub = real H/W×1.5 interpolate (VRAM-true); real = MinimaxH3LatentUpscaler3D.
+    """
+    mode = (mode or "stub").strip().lower()
+    sep = g.add("LTXVSeparateAVLatent", av_latent=[latent, 0])
+    # sep outputs: video_latent=0, audio_latent=1
+    if mode == "real":
+        model_name = os.environ.get(
+            "H3_LATENT_UPSCALER",
+            "minimax_h3_latent_upscaler_3d_fp16.safetensors",
+        )
+        up_vid = g.add(
+            "MinimaxH3LatentUpscaler3D",
+            latent=[sep, 0],
+            model_name=model_name,
+            mode="scale by multiplier",
+            **{"mode.scale": 1.5},
+            align=32,
+            # Official example / goldfish last False: temporal chunking off.
+            enable_temporal_chunking=False,
+            force_unload=False,
+            device="cuda",
+            precision="fp16",
+        )
+    elif mode in {"none", "identity", "1.0"}:
+        # T5: keep AV split/concat + pass2, no spatial enlarge.
+        up_vid = g.add(
+            "H3LatentSpatialUpsampleStub",
+            latent=[sep, 0],
+            scale=1.0,
+            mode="nearest",
+        )
+    else:
+        up_vid = g.add(
+            "H3LatentSpatialUpsampleStub",
+            latent=[sep, 0],
+            scale=1.5,
+            mode="bilinear",
+        )
+    return g.add(
+        "LTXVConcatAVLatent",
+        video_latent=[up_vid, 0],
+        audio_latent=[sep, 1],
+    )
+
+
 def _tail(
     g: GraphBuilder,
     *,
@@ -125,6 +385,9 @@ def _tail(
     sampler_name: str,
     scheduler: str,
     filename_prefix: str,
+    denoise: float = 1.0,
+    two_pass: bool | None = None,
+    upscaler: str | None = None,
 ) -> None:
     """Sampler -> decode -> mux -> save, mirroring video_minimax_h3_t2v.json.
 
@@ -132,7 +395,35 @@ def _tail(
     positive conditioning, and the guider runs it with no CFG rather than
     faking an unconditional branch. Both VAEs read the joint AV latent
     directly - the nested video/audio pair needs no explicit split node.
+
+    denoise<1.0 enables partial re-sample (v1.5 refine second pass) when the
+    latent already holds an encoded init video/frame.
+
+    When two_pass is enabled, delegates to _tail_two_pass (SplitSigmas +
+    latent upscale + second sampler). CreateVideo only after pass2 decode.
     """
+    if two_pass is None:
+        two_pass = _two_pass_enabled()
+    if two_pass:
+        _tail_two_pass(
+            g,
+            model=model,
+            positive=positive,
+            latent=latent,
+            video_vae=video_vae,
+            audio_vae=audio_vae,
+            seed=seed,
+            steps=steps,
+            sampler_name=sampler_name,
+            scheduler=scheduler,
+            filename_prefix=filename_prefix,
+            denoise=denoise,
+            upscaler=upscaler
+            or os.environ.get("H3_TWO_PASS_UPSCALER", "stub").strip()
+            or "stub",
+        )
+        return
+
     noise = g.add("RandomNoise", noise_seed=seed)
     guider = g.add("BasicGuider", model=[model, 0], conditioning=[positive, 0])
     sampler = g.add("KSamplerSelect", sampler_name=sampler_name)
@@ -141,7 +432,7 @@ def _tail(
         model=[model, 0],
         scheduler=scheduler,
         steps=steps,
-        denoise=1.0,
+        denoise=float(denoise),
     )
     sampled = g.add(
         "SamplerCustomAdvanced",
@@ -153,6 +444,88 @@ def _tail(
     )
     frames = g.add("VAEDecode", samples=[sampled, 0], vae=[video_vae, 0])
     audio = g.add("VAEDecodeAudio", samples=[sampled, 0], vae=[audio_vae, 0])
+    video = g.add(
+        "CreateVideo", images=[frames, 0], fps=FPS, bit_depth=8, audio=[audio, 0]
+    )
+    g.add(
+        "SaveVideo",
+        video=[video, 0],
+        filename_prefix=filename_prefix,
+        format="auto",
+        codec="auto",
+    )
+
+
+def _tail_two_pass(
+    g: GraphBuilder,
+    *,
+    model: str,
+    positive: str,
+    latent: str,
+    video_vae: str,
+    audio_vae: str,
+    seed: int,
+    steps: int,
+    sampler_name: str,
+    scheduler: str,
+    filename_prefix: str,
+    denoise: float = 1.0,
+    upscaler: str = "stub",
+) -> None:
+    """Two-pass: pass1 → (optional spatial ×1.5) → pass2 → decode → CreateVideo.
+
+    Spatial ×1.5 path (quality): **full** pass1 denoise → Upscaler → pass2
+    ManualSigmas high-σ refine. Mid-SplitSigmas + ×1.5 yields mush / no subject
+    (or tan/grid if split too early). Identity upscale keeps SplitSigmas high/low.
+    """
+    noise = g.add("RandomNoise", noise_seed=seed)
+    guider = g.add("BasicGuider", model=[model, 0], conditioning=[positive, 0])
+    sampler = g.add("KSamplerSelect", sampler_name=sampler_name)
+    sigmas = g.add(
+        "BasicScheduler",
+        model=[model, 0],
+        scheduler=scheduler,
+        steps=steps,
+        denoise=float(denoise),
+    )
+    spatial = _spatial_upscale(upscaler)
+    if spatial:
+        # Full low-res denoise before learned/stub spatial enlarge.
+        pass1_sigmas_ref = [sigmas, 0]
+    else:
+        split = _split_sigma_start(steps)
+        split_node = g.add("SplitSigmas", sigmas=[sigmas, 0], step=split)
+        pass1_sigmas_ref = [split_node, 0]
+    pass1 = g.add(
+        "SamplerCustomAdvanced",
+        noise=[noise, 0],
+        guider=[guider, 0],
+        sampler=[sampler, 0],
+        sigmas=pass1_sigmas_ref,
+        latent_image=[latent, 1],
+    )
+    up = _latent_upscale_node(g, latent=pass1, mode=upscaler)
+    if spatial:
+        manual = _pass2_manual_sigmas()
+        if not manual:
+            raise ValueError(
+                "spatial upscale requires pass2 ManualSigmas "
+                "(unset H3_PASS2_MANUAL_SIGMAS or set a sigma list)"
+            )
+        pass2_sigmas = g.add("ManualSigmas", sigmas=manual)
+        pass2_sigmas_ref = [pass2_sigmas, 0]
+    else:
+        pass2_sigmas_ref = [split_node, 1]
+    pass2 = g.add(
+        "SamplerCustomAdvanced",
+        noise=[noise, 0],
+        guider=[guider, 0],
+        sampler=[sampler, 0],
+        sigmas=pass2_sigmas_ref,
+        latent_image=[up, 0],
+    )
+    frames = g.add("VAEDecode", samples=[pass2, 0], vae=[video_vae, 0])
+    audio = g.add("VAEDecodeAudio", samples=[pass2, 0], vae=[audio_vae, 0])
     video = g.add(
         "CreateVideo", images=[frames, 0], fps=FPS, bit_depth=8, audio=[audio, 0]
     )
@@ -222,6 +595,7 @@ def _apply_acceleration(g: GraphBuilder, model: str, preset: str) -> str:
             end_percent=0.90,
             min_tokens=4096,
             int8_qk=True,
+            int8_pv=True,
             sink_conditioning="exact_kv_and_rows",
             morton=False,
             morton_curve="2d_frame",
@@ -249,10 +623,32 @@ def _common_loaders(
     sage_attention: str = "disabled",
     acceleration: str = "balanced",
 ):
-    model = g.add("UNETLoader", unet_name=unet, weight_dtype="default")
+    use_hybrid = _env_flag("H3_USE_HYBRID_LOADER")
+    if use_hybrid:
+        resolve_h3_models()
+        base = os.environ.get("H3_FL2VA_MODEL", "").strip() or MODEL_FL2VA
+        overlay = os.environ.get("H3_REF2VA_MODEL", "").strip() or MODEL_REF2VA
+        model = g.add(
+            "MinimaxH3_HybridLoader",
+            base_model=base,
+            overlay_model=overlay,
+        )
+    else:
+        model = g.add("UNETLoader", unet_name=unet, weight_dtype="default")
 
     if sage_attention != "disabled":
         model = g.add(SAGE_NODE, model=[model, 0], sage_attention=sage_attention)
+
+    # Optional LoRA (e.g. H3 turbo). Applied after sage, before sigma-shift / Sol.
+    lora_name = os.environ.get("H3_LORA", "").strip()
+    if lora_name:
+        strength = float(os.environ.get("H3_LORA_STRENGTH", "1.0") or "1.0")
+        model = g.add(
+            "LoraLoaderModelOnly",
+            model=[model, 0],
+            lora_name=lora_name,
+            strength_model=strength,
+        )
 
     # The template omits MiniMaxH3SigmaShift entirely: supported_models.py
     # already applies shift=12.0 for this architecture. Only add the node when
@@ -267,9 +663,9 @@ def _common_loaders(
 
     model = _apply_acceleration(g, model, acceleration)
 
-    clip = g.add("CLIPLoader", clip_name=TEXT_ENCODER, type=CLIP_TYPE, device="default")
-    video_vae = g.add("VAELoader", vae_name=VAE_VIDEO)
-    audio_vae = g.add("VAELoader", vae_name=VAE_AUDIO)
+    clip = g.add("CLIPLoader", clip_name=_text_encoder_name(), type=CLIP_TYPE, device="default")
+    video_vae = g.add("VAELoader", vae_name=_video_vae_name())
+    audio_vae = g.add("VAELoader", vae_name=_audio_vae_name())
     return model, clip, video_vae, audio_vae
 
 
@@ -290,7 +686,11 @@ def build_image_to_video(
     filename_prefix: str,
     sage_attention: str = "disabled",
     acceleration: str = "balanced",
+    denoise: float = 1.0,
+    two_pass: bool | None = None,
+    upscaler: str | None = None,
 ) -> dict[str, Any]:
+    resolve_h3_models()
     g = GraphBuilder()
     model, clip, video_vae, audio_vae = _common_loaders(
         g, MODEL_FL2VA, shift_video, shift_audio, sage_attention, acceleration
@@ -322,6 +722,9 @@ def build_image_to_video(
         sampler_name=sampler_name,
         scheduler=scheduler,
         filename_prefix=filename_prefix,
+        denoise=denoise,
+        two_pass=two_pass,
+        upscaler=upscaler,
     )
     return g.nodes
 
@@ -345,7 +748,11 @@ def build_reference_to_video(
     filename_prefix: str,
     sage_attention: str = "disabled",
     acceleration: str = "balanced",
+    denoise: float = 1.0,
+    two_pass: bool | None = None,
+    upscaler: str | None = None,
 ) -> dict[str, Any]:
+    resolve_h3_models()
     g = GraphBuilder()
     model, clip, video_vae, audio_vae = _common_loaders(
         g, MODEL_REF2VA, shift_video, shift_audio, sage_attention, acceleration
@@ -391,5 +798,8 @@ def build_reference_to_video(
         sampler_name=sampler_name,
         scheduler=scheduler,
         filename_prefix=filename_prefix,
+        denoise=denoise,
+        two_pass=two_pass,
+        upscaler=upscaler,
     )
     return g.nodes

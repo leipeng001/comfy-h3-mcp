@@ -36,6 +36,11 @@ class AccelerationGraphTests(unittest.TestCase):
         self.assertIn(graphs.SOL_NODE, classes)
         self.assertNotIn(graphs.EASYCACHE_NODE, classes)
 
+    def test_balanced_sol_includes_int8_pv(self):
+        graph = build("balanced")
+        sol = next(v for v in graph.values() if v["class_type"] == graphs.SOL_NODE)
+        self.assertTrue(sol["inputs"].get("int8_pv"))
+
     def test_balanced_and_fast_compose_sol_then_cache(self):
         for preset in ("balanced", "fast"):
             with self.subTest(preset=preset):

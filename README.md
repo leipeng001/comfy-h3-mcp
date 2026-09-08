@@ -48,6 +48,24 @@ git clone https://github.com/kijai/ComfyUI-SolAttn_triton.git
 loaded. Sol-Attn's Triton kernels compile for each new tensor shape, so the
 first run at a resolution/duration can be slower than subsequent warm runs.
 
+## Two-pass refine (金鱼拓扑 / 质量冻结)
+
+空间升潜质量路径（`H3_TWO_PASS_UPSCALER=stub|real`）：**一采跑满** → Separate →
+Upscaler×1.5 → Concat → **ManualSigmas** 高 σ 二采 → decode。  
+**禁止** mid-SplitSigmas + ×1.5（会糊主体 / tan-grid）。  
+`upscaler=none`（identity）仍可用 SplitSigmas high/low 两段。
+
+| Env | Meaning |
+|---|---|
+| `REFINE_TWO_PASS=1` | Enable when `H3_RESOURCE_PROFILE=refine` |
+| `H3_TWO_PASS_UPSCALER=stub\|real\|none` | stub/real = 空间×1.5；none = identity |
+| `H3_USE_HYBRID_LOADER=1` | `MinimaxH3_HybridLoader` |
+| `H3_LORA` / `H3_LORA_STRENGTH` | 可选 Turbo LoRA（质量冻结：金鱼 v4 @1.0） |
+| `H3_PASS2_MANUAL_SIGMAS` | 二采 sigma 列表；空字符串可关（仅 identity） |
+
+加速对照与冻结表见仓库外 `docs/h3_accel_ab.md` / `docs/h3_two_pass_bench.md`（本机 aigc 工作区）。  
+Install stub node from `custom_nodes/h3_latent_upsample_stub` into ComfyUI.
+
 ## ComfyUI GUI workflow
 
 Load [`workflows/minimax_h3_sol_balanced.json`](workflows/minimax_h3_sol_balanced.json)
