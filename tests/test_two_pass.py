@@ -41,6 +41,33 @@ class TwoPassGraphTests(unittest.TestCase):
         self.assertEqual(len(samplers), 1)
         self.assertNotIn("SplitSigmas", {n["class_type"] for n in g.values()})
 
+    def _image_graph(self, upscaler):
+        return graphs.build_image_to_video(prompt="static shot", width=960,
+            height=544, length=124, first_frame="approved.png", last_frame="end.png",
+            seed=42, steps=8, sampler_name="euler", scheduler="beta",
+            shift_video=None, shift_audio=None, filename_prefix="test",
+            acceleration="off", two_pass=True, upscaler=upscaler)
+
+    def test_image_spatial_pass2_reencodes_boundaries_at_output_geometry(self):
+        g = self._image_graph("real")
+        samplers = [n for n in g.values() if n["class_type"] == "SamplerCustomAdvanced"]
+        conditions = [g[g[s["inputs"]["guider"][0]]["inputs"]["conditioning"][0]]
+                      for s in samplers]
+        self.assertEqual([(c["inputs"]["width"], c["inputs"]["height"])
+                          for c in conditions], [(960, 544), (1440, 832)])
+        for role in ("first_frame", "last_frame"):
+            self.assertEqual(conditions[0]["inputs"][role], conditions[1]["inputs"][role])
+        self.assertEqual(conditions[1]["inputs"]["length"], 124)
+
+    def test_image_identity_pass_keeps_matching_condition(self):
+        g = self._image_graph("none")
+        samplers = [n for n in g.values() if n["class_type"] == "SamplerCustomAdvanced"]
+        self.assertEqual(samplers[0]["inputs"]["guider"], samplers[1]["inputs"]["guider"])
+
+    def test_image_unverified_spatial_geometry_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "verified real upscaler"):
+            self._image_graph("stub")
+
     def test_two_pass_split_upscale_two_samplers(self):
         # Identity: SplitSigmas high/low, no learned enlarge.
         g = self._build(two_pass=True, upscaler="none")

@@ -505,6 +505,19 @@ def _tail_two_pass(
         latent_image=[latent, 1],
     )
     up = _latent_upscale_node(g, latent=pass1, mode=upscaler)
+    pass2_guider = guider
+    condition = g.nodes[positive]
+    if spatial and condition["class_type"] == "MiniMaxH3ImageToVideo":
+        if upscaler != "real":
+            raise ValueError("I2V spatial two-pass requires the verified real upscaler geometry")
+        # FL2VA carries spatial first/last-frame conditions. Reusing pass1's
+        # condition after enlargement makes the model index mismatched tensors.
+        # Match the deployed upscaler's round(pixel * 1.5 / 32) * 32 rule.
+        inputs = dict(condition["inputs"])
+        for axis in ("width", "height"):
+            inputs[axis] = max(32, round(inputs[axis] * 1.5 / 32) * 32)
+        high_condition = g.add("MiniMaxH3ImageToVideo", **inputs)
+        pass2_guider = g.add("BasicGuider", model=[model, 0], conditioning=[high_condition, 0])
     if spatial:
         manual = _pass2_manual_sigmas()
         if not manual:
@@ -519,7 +532,7 @@ def _tail_two_pass(
     pass2 = g.add(
         "SamplerCustomAdvanced",
         noise=[noise, 0],
-        guider=[guider, 0],
+        guider=[pass2_guider, 0],
         sampler=[sampler, 0],
         sigmas=pass2_sigmas_ref,
         latent_image=[up, 0],
